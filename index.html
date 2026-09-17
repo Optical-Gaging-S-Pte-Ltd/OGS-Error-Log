@@ -197,6 +197,10 @@
   ::-webkit-scrollbar{width:8px;}
   ::-webkit-scrollbar-thumb{background:var(--steel-700); border-radius:4px;}
 
+  #list, #list *{
+    -webkit-user-select:none; -moz-user-select:none; user-select:none;
+  }
+
   #loginGate{
     position:fixed; inset:0; z-index:200;
     background:var(--steel-950);
@@ -224,6 +228,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-app-compat.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-auth-compat.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-firestore-compat.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-storage-compat.min.js"></script>
 <script>
   const firebaseConfig = {
     apiKey: "AIzaSyCF2Z1xrVUlwWb43-0M8lo-rgyxlC_-jdA",
@@ -233,11 +238,12 @@
     messagingSenderId: "813420145001",
     appId: "1:813420145001:web:bae3a428d672bd6a57f5f8"
   };
-  let auth, db;
+  let auth, db, storage;
   if(typeof firebase !== 'undefined'){
     firebase.initializeApp(firebaseConfig);
     auth = firebase.auth();
     db = firebase.firestore();
+    storage = firebase.storage();
   }
   window.addEventListener('DOMContentLoaded', () => {
     if(typeof firebase === 'undefined'){
@@ -288,6 +294,10 @@
       <option value="resolved">Resolved</option>
       <option value="unresolved">Unresolved</option>
     </select>
+    <select id="filterCompleteness">
+      <option value="">All entries</option>
+      <option value="incomplete">Incomplete only (no model/version info)</option>
+    </select>
   </div>
 </header>
 
@@ -307,7 +317,7 @@
 
 <div class="overlay" id="overlay">
   <div class="modal">
-    <h2>Log a fault</h2>
+    <h2 id="modalTitle">Log a fault</h2>
     <div class="modsub">Shared with the whole team — visible to every agent instantly.</div>
 
     <div class="formrow">
@@ -348,6 +358,16 @@
       <div id="imgPreviewWrap" style="display:none; margin-top:10px;">
         <img id="imgPreview" style="max-width:100%; max-height:180px; border-radius:8px; border:1px solid var(--steel-700); display:block;">
         <button type="button" onclick="clearImage()" style="margin-top:8px; background:transparent; border:1px solid var(--steel-700); color:var(--paper-dim); padding:6px 10px; border-radius:6px; font-size:12px; cursor:pointer;">✕ Remove photo</button>
+      </div>
+    </div>
+
+    <div class="formrow">
+      <label>Attach video (optional — demo mode: short low-quality clips only until Blaze is active)</label>
+      <input type="file" id="f_video" accept="video/*" style="padding:9px; font-size:13px;">
+      <div id="videoPreviewWrap" style="display:none; margin-top:10px;">
+        <video id="videoPreview" controls style="max-width:100%; max-height:220px; border-radius:8px; border:1px solid var(--steel-700); display:block;"></video>
+        <div id="videoUploadStatus" style="font-size:12px; color:var(--paper-dim); margin-top:6px;"></div>
+        <button type="button" onclick="clearVideo()" style="margin-top:8px; background:transparent; border:1px solid var(--steel-700); color:var(--paper-dim); padding:6px 10px; border-radius:6px; font-size:12px; cursor:pointer;">✕ Remove video</button>
       </div>
     </div>
 
@@ -494,6 +514,133 @@ document.getElementById('f_image').addEventListener('change', (e)=>{
   handleImageSelect(e.target.files[0]);
 });
 
+let pendingVideoUrl = null;
+let pendingVideoPath = null;
+let videoUploadInProgress = false;
+let activeUploadTask = null;
+
+function clearVideo(){
+  if(activeUploadTask){
+    try{ activeUploadTask.cancel(); }catch(e){}
+    activeUploadTask = null;
+  }
+  videoUploadInProgress = false;
+  pendingVideoUrl = null;
+  pendingVideoPath = null;
+  document.getElementById('f_video').value = '';
+  document.getElementById('videoPreviewWrap').style.display = 'none';
+  document.getElementById('videoPreview').src = '';
+  document.getElementById('videoUploadStatus').textContent = '';
+}
+
+const VIDEO_INLINE_LIMIT = 700 * 1024; // bytes, leaves headroom under Firestore's 1MB doc cap
+
+function tryInlineVideoFallback(file){
+  const statusEl = document.getElementById('videoUploadStatus');
+  const wrapEl = document.getElementById('videoPreviewWrap');
+  const previewEl = document.getElementById('videoPreview');
+  wrapEl.style.display = 'block';
+  if(!previewEl.src) previewEl.src = URL.createObjectURL(file);
+  if(file.size > VIDEO_INLINE_LIMIT * 1.4){
+    // Base64 inflates size ~33%, so reject early if the raw file is already clearly too big
+    statusEl.textContent = '';
+    toast('No Storage plan active — this clip is too large for the demo fallback. Try a shorter/lower-res clip (a few seconds).');
+    clearVideo();
+    return;
+  }
+  statusEl.textContent = 'Storage plan not active — storing as low-quality demo clip…';
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const dataUrl = e.target.result;
+    const approxBytes = dataUrl.length * 0.75;
+    if(approxBytes > VIDEO_INLINE_LIMIT){
+      statusEl.textContent = '';
+      toast('Clip still too large even for the demo fallback — try trimming it shorter.');
+      clearVideo();
+      return;
+    }
+    pendingVideoUrl = dataUrl;
+    pendingVideoPath = null;
+    statusEl.textContent = 'Stored as demo clip ✓ (upgrade to Blaze for real video storage)';
+  };
+  reader.onerror = () => {
+    statusEl.textContent = '';
+    toast('Could not read that video file — try again');
+    clearVideo();
+  };
+  reader.readAsDataURL(file);
+}
+
+function handleVideoSelect(file){
+  if(!file) return;
+  if(!storage){
+    tryInlineVideoFallback(file);
+    return;
+  }
+  const statusEl = document.getElementById('videoUploadStatus');
+  const wrapEl = document.getElementById('videoPreviewWrap');
+  const previewEl = document.getElementById('videoPreview');
+
+  wrapEl.style.display = 'block';
+  previewEl.src = URL.createObjectURL(file);
+  statusEl.textContent = 'Uploading… 0%';
+  videoUploadInProgress = true;
+
+  try{
+    const path = `videos/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g,'_')}`;
+    const ref = storage.ref().child(path);
+    const uploadTask = ref.put(file);
+    activeUploadTask = uploadTask;
+    let settled = false;
+
+    const bailToFallback = () => {
+      if(settled) return;
+      settled = true;
+      try{ uploadTask.cancel(); }catch(e){}
+      activeUploadTask = null;
+      videoUploadInProgress = false;
+      tryInlineVideoFallback(file);
+    };
+
+    // Firebase silently retries failed uploads internally, which can take a
+    // long time before ever reaching the error callback below. If nothing
+    // has happened within a few seconds, bail out to the fallback ourselves
+    // rather than leaving the button stuck at "Uploading… 0%".
+    const stallTimer = setTimeout(bailToFallback, 6000);
+
+    uploadTask.on('state_changed',
+      (snapshot)=>{
+        if(settled) return;
+        clearTimeout(stallTimer); // real progress is happening — stop the stall timer
+        const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+        statusEl.textContent = `Uploading… ${pct}%`;
+      },
+      (err)=>{
+        clearTimeout(stallTimer);
+        bailToFallback();
+      },
+      async ()=>{
+        if(settled) return;
+        settled = true;
+        clearTimeout(stallTimer);
+        activeUploadTask = null;
+        pendingVideoUrl = await uploadTask.snapshot.ref.getDownloadURL();
+        pendingVideoPath = path;
+        videoUploadInProgress = false;
+        statusEl.textContent = 'Uploaded ✓';
+      }
+    );
+  }catch(err){
+    videoUploadInProgress = false;
+    // Storage isn't provisioned at all on this plan — put()/ref() threw synchronously
+    tryInlineVideoFallback(file);
+  }
+}
+
+document.getElementById('f_video').addEventListener('change', (e)=>{
+  handleVideoSelect(e.target.files[0]);
+});
+
 function toast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -578,6 +725,18 @@ function escapeHtml(s){
 }
 function escapeAttr(s){ return escapeHtml(s); }
 
+function canEditEntry(e){
+  if(!auth || !auth.currentUser) return false;
+  if(e.authorUid) return e.authorUid === auth.currentUser.uid;
+  // Legacy entry with no recorded author — fall back to matching the
+  // typed "Logged by" name against the signed-in agent's email.
+  if(!e.by) return false;
+  const emailPrefix = (auth.currentUser.email || '').split('@')[0].toLowerCase().replace(/[^a-z0-9]/g,'');
+  const byNormalized = e.by.toLowerCase().replace(/[^a-z0-9]/g,'');
+  if(!emailPrefix || !byNormalized) return false;
+  return emailPrefix.includes(byNormalized) || byNormalized.includes(emailPrefix);
+}
+
 function matchesQuery(e, q){
   if(!q) return true;
   const haystack = [e.error, e.model, e.serial, e.win, e.sw, e.solution, e.by].join(' ').toLowerCase();
@@ -590,12 +749,16 @@ function render(){
   const fModel = document.getElementById('filterModel').value;
   const fSw = document.getElementById('filterSw').value;
   const fStatus = document.getElementById('filterStatus').value;
+  const fComplete = document.getElementById('filterCompleteness').value;
+
+  const isIncomplete = (e) => !e.model && !e.serial && !e.win && !e.sw;
 
   let filtered = entries.filter(e =>
     matchesQuery(e, q) &&
     (!fModel || e.model === fModel) &&
     (!fSw || e.sw === fSw) &&
-    (!fStatus || e.status === fStatus)
+    (!fStatus || e.status === fStatus) &&
+    (!fComplete || isIncomplete(e))
   );
   filtered.sort((a,b)=> (b.ts||0) - (a.ts||0));
 
@@ -623,6 +786,7 @@ function render(){
             ${e.sw ? `<span class="chip">${escapeHtml(e.sw)}</span>` : ''}
             <span class="chip" style="color:${e.status==='resolved'?'#4f9691':'#c2593f'}">${e.status==='resolved'?'✓ resolved':'⚠ unresolved'}</span>
             ${e.image ? `<span class="chip">📷 photo</span>` : ''}
+            ${e.videoUrl ? `<span class="chip">🎥 video</span>` : ''}
           </div>
         </div>
         <div class="chevron" id="chev-${realIdx}">▾</div>
@@ -631,12 +795,16 @@ function render(){
         <div class="field-label">Solution</div>
         <div class="field-val">${escapeHtml(e.solution)}</div>
         ${e.image ? `<div class="field-label">Screenshot</div><img src="${e.image}" style="max-width:100%; border-radius:8px; border:1px solid var(--steel-700); cursor:zoom-in;" onclick="window.open(this.src,'_blank')">` : ''}
+        ${e.videoUrl ? `<div class="field-label">Video</div><video controls preload="metadata" style="max-width:100%; border-radius:8px; border:1px solid var(--steel-700);"><source src="${escapeAttr(e.videoUrl)}"></video>` : ''}
         ${e.link ? `<div class="field-label">Reference</div><div class="field-val"><a href="${escapeAttr(e.link)}" target="_blank" rel="noopener" style="color:#e8a33d; word-break:break-all;">${escapeHtml(e.link)}</a></div>` : ''}
         <div class="footer-meta">
-          <span>Logged by ${escapeHtml(e.by||'—')}</span>
+          <span>Logged by ${escapeHtml(e.by||'—')}${e.editedAt ? ` · <span style="color:var(--amber);">edited ${new Date(e.editedAt).toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'})}</span>` : ''}</span>
           <span>${date}</span>
         </div>
-        <button type="button" onclick="event.stopPropagation(); deleteEntry(${realIdx})" style="margin-top:10px; width:100%; background:transparent; border:1px solid var(--danger); color:var(--danger); padding:9px; border-radius:6px; font-size:12px; cursor:pointer;">🗑 Delete entry</button>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          ${canEditEntry(e) ? `<button type="button" onclick="event.stopPropagation(); openEditModal(${realIdx})" style="flex:1; background:transparent; border:1px solid var(--teal); color:var(--teal); padding:9px; border-radius:6px; font-size:12px; cursor:pointer;">✎ Edit entry</button>` : ''}
+          <button type="button" onclick="event.stopPropagation(); deleteEntry(${realIdx})" style="flex:1; background:transparent; border:1px solid var(--danger); color:var(--danger); padding:9px; border-radius:6px; font-size:12px; cursor:pointer;">🗑 Delete entry</button>
+        </div>
       </div>
     </div>`;
   }).join('');
@@ -658,6 +826,8 @@ function closeConfirm(confirmed){
 async function deleteEntry(idx){
   const e = entries[idx];
   if(!e) return;
+  const authorized = await askPasscode();
+  if(!authorized) return;
   const ok = await askConfirm(`Delete "${e.error.slice(0,60)}${e.error.length>60?'…':''}"? This cannot be undone.`);
   if(!ok) return;
   try{
@@ -682,14 +852,55 @@ function setStatus(val){
   });
 }
 
+let editingEntryId = null;
+
 function openModal(){
+  editingEntryId = null;
+  document.getElementById('modalTitle').textContent = 'Log a fault';
+  document.getElementById('saveBtn').textContent = 'Save to log';
   document.getElementById('overlay').classList.add('open');
 }
+
+function openEditModal(idx){
+  const e = entries[idx];
+  if(!e) return;
+  editingEntryId = e.id;
+  document.getElementById('modalTitle').textContent = 'Edit fault';
+  document.getElementById('saveBtn').textContent = 'Save changes';
+  document.getElementById('f_error').value = e.error || '';
+  document.getElementById('f_model').value = e.model || '';
+  document.getElementById('f_serial').value = e.serial || '';
+  document.getElementById('f_win').value = e.win || '';
+  document.getElementById('f_sw').value = e.sw || '';
+  document.getElementById('f_solution').value = e.solution || '';
+  document.getElementById('f_link').value = e.link || '';
+  document.getElementById('f_by').value = e.by || '';
+  setStatus(e.status === 'unresolved' ? 'unresolved' : 'resolved');
+  if(e.image){
+    pendingImage = e.image;
+    document.getElementById('imgPreview').src = e.image;
+    document.getElementById('imgPreviewWrap').style.display = 'block';
+  } else {
+    clearImage();
+  }
+  if(e.videoUrl){
+    pendingVideoUrl = e.videoUrl;
+    document.getElementById('videoPreview').src = e.videoUrl;
+    document.getElementById('videoPreviewWrap').style.display = 'block';
+    document.getElementById('videoUploadStatus').textContent = 'Uploaded ✓';
+  } else {
+    clearVideo();
+  }
+  document.getElementById('overlay').classList.add('open');
+}
+
 function closeModal(){
   document.getElementById('overlay').classList.remove('open');
   ['f_error','f_model','f_serial','f_win','f_sw','f_solution','f_link','f_by'].forEach(id=>document.getElementById(id).value='');
   clearImage();
+  clearVideo();
   setStatus('resolved');
+  editingEntryId = null;
 }
 
 async function saveEntry(){
@@ -699,6 +910,12 @@ async function saveEntry(){
     toast('Error message and solution are required');
     return;
   }
+  if(videoUploadInProgress){
+    toast('Video still uploading — wait for it to finish');
+    return;
+  }
+  const rawLink = document.getElementById('f_link').value.trim();
+  const link = rawLink && !/^https?:\/\//i.test(rawLink) ? `https://${rawLink}` : rawLink;
   const entry = {
     error,
     model: document.getElementById('f_model').value.trim(),
@@ -706,11 +923,14 @@ async function saveEntry(){
     win: document.getElementById('f_win').value.trim(),
     sw: document.getElementById('f_sw').value.trim(),
     solution,
-    link: document.getElementById('f_link').value.trim(),
+    link,
     image: pendingImage || null,
+    videoUrl: pendingVideoUrl || null,
     status: currentStatus,
     by: document.getElementById('f_by').value.trim(),
-    ts: Date.now()
+    ts: editingEntryId ? (entries.find(e=>e.id===editingEntryId)?.ts || Date.now()) : Date.now(),
+    authorUid: editingEntryId ? (entries.find(e=>e.id===editingEntryId)?.authorUid || (auth.currentUser && auth.currentUser.uid)) : (auth.currentUser && auth.currentUser.uid),
+    editedAt: editingEntryId ? Date.now() : null
   };
   const projectedSize = new Blob([JSON.stringify(entry)]).size;
   if(projectedSize > 900 * 1024){
@@ -720,9 +940,14 @@ async function saveEntry(){
   const btn = document.getElementById('saveBtn');
   btn.textContent = 'Saving…'; btn.disabled = true;
   try{
-    await addEntryToDb(entry);
+    if(editingEntryId){
+      await db.collection('entries').doc(editingEntryId).set(entry);
+      toast('Entry updated');
+    } else {
+      await addEntryToDb(entry);
+      toast('Entry saved to shared log');
+    }
     closeModal();
-    toast('Entry saved to shared log');
   }catch(err){
     toast('Save failed — try again');
   }
@@ -734,7 +959,11 @@ document.getElementById('searchInput').addEventListener('input', render);
 document.getElementById('filterModel').addEventListener('change', render);
 document.getElementById('filterSw').addEventListener('change', render);
 document.getElementById('filterStatus').addEventListener('change', render);
+document.getElementById('filterCompleteness').addEventListener('change', render);
 document.getElementById('overlay').addEventListener('click', (e)=>{ if(e.target.id==='overlay') closeModal(); });
+
+document.getElementById('list').addEventListener('contextmenu', (e)=>{ e.preventDefault(); });
+document.getElementById('list').addEventListener('copy', (e)=>{ e.preventDefault(); });
 
 const BACKUP_PASSCODE = '333';
 let passcodeResolve = null;
