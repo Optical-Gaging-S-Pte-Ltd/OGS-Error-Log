@@ -596,6 +596,7 @@ function handleVideoSelect(file){
     const bailToFallback = () => {
       if(settled) return;
       settled = true;
+      clearTimeout(stallTimer);
       try{ uploadTask.cancel(); }catch(e){}
       activeUploadTask = null;
       videoUploadInProgress = false;
@@ -606,12 +607,21 @@ function handleVideoSelect(file){
     // long time before ever reaching the error callback below. If nothing
     // has happened within a few seconds, bail out to the fallback ourselves
     // rather than leaving the button stuck at "Uploading… 0%".
-    const stallTimer = setTimeout(bailToFallback, 6000);
+    let stallTimer = setTimeout(bailToFallback, 6000);
+    let lastBytesSeen = -1;
 
     uploadTask.on('state_changed',
       (snapshot)=>{
         if(settled) return;
-        clearTimeout(stallTimer); // real progress is happening — stop the stall timer
+        // Only reset the stall window on genuine forward progress — retry
+        // attempts that report 0 bytes transferred (repeatedly, after a
+        // blocked CORS request) must NOT keep pushing the timer back, or
+        // it never fires and the button stays stuck at "Uploading… 0%".
+        if(snapshot.bytesTransferred > lastBytesSeen){
+          lastBytesSeen = snapshot.bytesTransferred;
+          clearTimeout(stallTimer);
+          stallTimer = setTimeout(bailToFallback, 6000);
+        }
         const pct = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
         statusEl.textContent = `Uploading… ${pct}%`;
       },
